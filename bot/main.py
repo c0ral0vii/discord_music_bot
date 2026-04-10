@@ -10,10 +10,15 @@ from urllib.parse import urlparse
 import discord
 from discord.ext import commands
 
+from bot.chess_game import start_chess_game
 from config.config import settings
 from music_catcher.soundclound_catcher import SoundCloudCatcher, SoundCloudDownloadError
 from music_catcher.spotify_catcher import SpotifyCatcher, SpotifyDownloadError
-from music_catcher.youtube_catcher import DownloadedTrack, YouTubeCatcher, YouTubeDownloadError
+from music_catcher.youtube_catcher import (
+    DownloadedTrack,
+    YouTubeCatcher,
+    YouTubeDownloadError,
+)
 
 intents = discord.Intents.default()
 intents.message_content = settings.MESSAGE_CONTENT_INTENT
@@ -25,6 +30,8 @@ spotify_catcher = SpotifyCatcher(output_dir=Path("downloads"))
 
 IDLE_DISCONNECT_SECONDS = 300
 SEEK_STEP_SECONDS = 10.0
+DOWNLOAD_TIMEOUT_SECONDS = 180
+VOICE_CONNECT_TIMEOUT_SECONDS = 60
 
 
 @dataclass(slots=True)
@@ -184,6 +191,19 @@ async def _send_text_message(channel_id: int, message: str) -> None:
             await channel.send(message)
 
 
+async def _disconnect_voice_protocol(voice_protocol: discord.VoiceProtocol | None) -> None:
+    if voice_protocol is None:
+        return
+
+    if isinstance(voice_protocol, discord.VoiceClient):
+        with suppress(discord.DiscordException):
+            if voice_protocol.is_playing() or voice_protocol.is_paused():
+                voice_protocol.stop()
+
+    with suppress(discord.DiscordException, AttributeError, RuntimeError):
+        await voice_protocol.disconnect(force=True)
+
+
 def _track_label(item: QueuedTrack) -> str:
     return item.title_hint or item.url
 
@@ -223,6 +243,22 @@ def _build_queue_items(url: str, text_channel_id: int, requested_by_id: int) -> 
                 duration_seconds=track.duration_seconds,
             )
             for track in spotify_tracks
+        ]
+
+    if youtube_catcher.is_playlist_url(url):
+        youtube_tracks = youtube_catcher.expand_playlist(url)
+        if not youtube_tracks:
+            raise YouTubeDownloadError("Не удалось получить треки из YouTube плейлиста.")
+
+        return [
+            QueuedTrack(
+                url=track.url,
+                text_channel_id=text_channel_id,
+                requested_by_id=requested_by_id,
+                title_hint=track.title,
+                duration_seconds=track.duration_seconds,
+            )
+            for track in youtube_tracks
         ]
 
     return [
@@ -353,7 +389,23 @@ async def _guild_player_worker(guild_id: int) -> None:
                     continue
 
                 try:
-                    track = await asyncio.to_thread(_download_track, item)
+                    await _send_text_message(
+                        item.text_channel_id,
+                        f"Загружаю: **{_track_label(item)}**",
+                    )
+                    track = await asyncio.wait_for(
+                        asyncio.to_thread(_download_track, item),
+                        timeout=DOWNLOAD_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    await _send_text_message(
+                        item.text_channel_id,
+                        (
+                            "Загрузка трека заняла слишком много времени "
+                            f"({DOWNLOAD_TIMEOUT_SECONDS} сек). Пропускаю."
+                        ),
+                    )
+                    continue
                 except (
                     YouTubeDownloadError,
                     SoundCloudDownloadError,
@@ -497,6 +549,10 @@ async def _ensure_voice_client(
         )
 
     voice_client = cast(discord.VoiceClient | None, voice_protocol)
+    if voice_client and not voice_client.is_connected():
+        await _disconnect_voice_protocol(voice_client)
+        voice_client = None
+
     if voice_client and voice_client.channel != author_channel:
         raise commands.CommandError(
             f"Бот уже в канале **{voice_client.channel.name}**. "
@@ -505,7 +561,12 @@ async def _ensure_voice_client(
 
     if voice_client is None:
         try:
-            connected = await author_channel.connect()
+            connected = await author_channel.connect(timeout=VOICE_CONNECT_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError as exc:
+            await _disconnect_voice_protocol(ctx.guild.voice_client if ctx.guild else None)
+            raise commands.CommandError(
+                "Не удалось подключиться к голосовому каналу вовремя. Попробуй еще раз."
+            ) from exc
         except RuntimeError as exc:
             error_text = str(exc).lower()
             if "davey library needed" in error_text:
@@ -515,6 +576,7 @@ async def _ensure_voice_client(
                 ) from exc
             raise
         if not isinstance(connected, discord.VoiceClient):
+            await _disconnect_voice_protocol(connected)
             raise commands.CommandError(
                 "Не удалось получить стандартный VoiceClient после подключения."
             )
@@ -547,7 +609,7 @@ async def play(ctx: commands.Context[commands.Bot], url: str | None = None) -> N
                 ctx.channel.id,
                 ctx.author.id,
             )
-    except SpotifyDownloadError as exc:
+    except (SpotifyDownloadError, YouTubeDownloadError) as exc:
         await ctx.send(str(exc))
         return
 
@@ -571,10 +633,17 @@ async def play(ctx: commands.Context[commands.Bot], url: str | None = None) -> N
         return
 
     end_position = start_position + len(items) - 1
-    await ctx.send(
-        f"Добавил **{len(items)}** треков в очередь. "
-        f"Позиции: **{start_position}-{end_position}**."
-    )
+    if start_position == 1:
+        await ctx.send(
+            f"Добавил **{len(items)}** треков в очередь. "
+            f"Позиции: **{start_position}-{end_position}**. "
+            "Начинаю загрузку первого..."
+        )
+    else:
+        await ctx.send(
+            f"Добавил **{len(items)}** треков в очередь. "
+            f"Позиции: **{start_position}-{end_position}**."
+        )
 
 
 @bot.command(name="skip")
@@ -674,6 +743,14 @@ async def menu_command(ctx: commands.Context[commands.Bot]) -> None:
     )
 
 
+@bot.command(name="chess_play")
+async def chess_play(
+    ctx: commands.Context[commands.Bot],
+    opponent: discord.Member | None = None,
+) -> None:
+    await start_chess_game(ctx, opponent)
+
+
 @bot.command(name="help")
 async def help_command(ctx: commands.Context[commands.Bot]) -> None:
     prefix = settings.PREFIX
@@ -685,6 +762,7 @@ async def help_command(ctx: commands.Context[commands.Bot]) -> None:
             f"`{prefix}skip` - перейти к следующему треку.",
             f"`{prefix}menu` - кнопки: -10s / +10s / skip / repeat track / repeat queue.",
             f"`{prefix}stop` - остановить и очистить очередь.",
+            f"`{prefix}chess_play @user` - начать шахматную партию с выбором сторон.",
             f"`{prefix}help` - показать это сообщение.",
         ]
     )
